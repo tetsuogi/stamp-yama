@@ -131,6 +131,18 @@
         .btn-secondary:hover {
             background: #e0e0e0;
         }
+        .btn-secondary:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        select {
+            padding: 8px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+        }
+        .page-controls {
+            margin-bottom: 10px;
+        }
         #preview-container {
             position: relative;
             border: 1px solid #ddd;
@@ -226,11 +238,11 @@
         <div class="controls">
             <div class="control-group">
                 <label>X座標:</label>
-                <input type="number" id="pos-x" value="265" step="1">
+                <input type="number" id="pos-x" value="270" step="1">
             </div>
             <div class="control-group">
                 <label>Y座標:</label>
-                <input type="number" id="pos-y" value="60" step="1">
+                <input type="number" id="pos-y" value="35" step="1">
             </div>
             <div class="control-group">
                 <label>サイズ:</label>
@@ -244,6 +256,17 @@
 
     <div class="section">
         <h2>3. プレビュー</h2>
+        <div class="controls page-controls">
+            <div class="control-group">
+                <label>対象ページ:</label>
+                <select id="page-select" disabled></select>
+                <span id="page-total"></span>
+            </div>
+            <button class="btn-secondary" id="prev-page-btn" onclick="changePage(currentPage - 1)" disabled>◀ 前へ</button>
+            <button class="btn-secondary" id="next-page-btn" onclick="changePage(currentPage + 1)" disabled>次へ ▶</button>
+            <button class="btn-secondary" id="last-page-btn" onclick="changePage(pdfDoc.numPages)" disabled>最終ページ</button>
+        </div>
+        <p class="help-text">※ 印鑑はプレビュー中のページに配置されます</p>
         <div id="preview-container">
             <canvas id="pdf-canvas"></canvas>
             <div id="hanko-overlay" style="display: none;">
@@ -274,6 +297,8 @@
         let pdfDoc = null;
         let currentScale = 1.5;
         let outputFileName = '';
+        let currentPage = 1;
+        let renderTask = null;
         
         // デフォルト位置（見積書の受諾印枠に合わせた値）
         const DEFAULT_X = 270;
@@ -291,6 +316,11 @@
         const posY = document.getElementById('pos-y');
         const hankoSize = document.getElementById('hanko-size');
         const generateBtn = document.getElementById('generate-btn');
+        const pageSelect = document.getElementById('page-select');
+        const pageTotal = document.getElementById('page-total');
+        const prevPageBtn = document.getElementById('prev-page-btn');
+        const nextPageBtn = document.getElementById('next-page-btn');
+        const lastPageBtn = document.getElementById('last-page-btn');
 
         // 初期化：印鑑画像を設定
         hankoPreview.src = HANKO_DATA_URL;
@@ -303,6 +333,9 @@
         posX.addEventListener('input', updateHankoPosition);
         posY.addEventListener('input', updateHankoPosition);
         hankoSize.addEventListener('input', updateHankoPosition);
+
+        // 対象ページ変更イベント
+        pageSelect.addEventListener('change', () => changePage(parseInt(pageSelect.value)));
 
         // ドラッグ&ドロップ
         const pdfBox = document.getElementById('pdf-box');
@@ -356,28 +389,70 @@
             // PDFをプレビュー表示
             const arrayBuffer = await file.arrayBuffer();
             pdfDoc = await pdfjsLib.getDocument(arrayBuffer).promise;
-            await renderPage(1);
-            
+
+            // 対象ページの選択肢を作成（初期は1ページ目）
+            currentPage = 1;
+            pageSelect.innerHTML = '';
+            for (let i = 1; i <= pdfDoc.numPages; i++) {
+                pageSelect.add(new Option(i + 'ページ目', i));
+            }
+            pageSelect.disabled = false;
+            pageTotal.textContent = '（全' + pdfDoc.numPages + 'ページ）';
+            updatePageControls();
+            await renderPage(currentPage);
+
             // 印鑑オーバーレイを表示
             hankoOverlay.style.display = 'block';
             updateHankoPosition();
-            
+
             generateBtn.disabled = false;
-            showStatus('PDFを読み込みました', 'success');
+            showStatus('PDFを読み込みました（全' + pdfDoc.numPages + 'ページ）', 'success');
+        }
+
+        async function changePage(pageNum) {
+            if (!pdfDoc || pageNum < 1 || pageNum > pdfDoc.numPages) return;
+
+            currentPage = pageNum;
+            updatePageControls();
+            await renderPage(currentPage);
+        }
+
+        function updatePageControls() {
+            pageSelect.value = currentPage;
+            prevPageBtn.disabled = currentPage <= 1;
+            nextPageBtn.disabled = currentPage >= pdfDoc.numPages;
+            lastPageBtn.disabled = currentPage >= pdfDoc.numPages;
         }
 
         async function renderPage(pageNum) {
             const page = await pdfDoc.getPage(pageNum);
+
+            // ページ取得中に別ページへ切り替えられた場合は描画しない
+            if (pageNum !== currentPage) return;
+
+            // 描画中のページがあればキャンセル（同一canvasへの同時描画エラー防止）
+            if (renderTask) renderTask.cancel();
+
             const viewport = page.getViewport({ scale: currentScale });
-            
+
             canvas.width = viewport.width;
             canvas.height = viewport.height;
-            
-            await page.render({
+
+            const task = page.render({
                 canvasContext: ctx,
                 viewport: viewport
-            }).promise;
-            
+            });
+            renderTask = task;
+
+            try {
+                await task.promise;
+            } catch (error) {
+                if (error.name === 'RenderingCancelledException') return;
+                throw error;
+            } finally {
+                if (renderTask === task) renderTask = null;
+            }
+
             updateHankoPosition();
         }
 
@@ -462,10 +537,10 @@
                 // WebP形式をPNGとして処理（pdf-libはWebPも対応）
                 const hankoImage = await pdfDocument.embedPng(hankoBytes);
                 
-                // 1ページ目に印鑑を配置
+                // 選択中のページに印鑑を配置
                 const pages = pdfDocument.getPages();
-                const firstPage = pages[0];
-                const { height } = firstPage.getSize();
+                const targetPage = pages[currentPage - 1];
+                const { height } = targetPage.getSize();
                 
                 const x = parseInt(posX.value) || DEFAULT_X;
                 const y = parseInt(posY.value) || DEFAULT_Y;
@@ -474,7 +549,7 @@
                 // PDF座標系は左下が原点なので、Y座標を変換
                 const pdfY = height - y - size;
                 
-                firstPage.drawImage(hankoImage, {
+                targetPage.drawImage(hankoImage, {
                     x: x,
                     y: pdfY,
                     width: size,
@@ -494,7 +569,7 @@
                 link.click();
                 URL.revokeObjectURL(url);
                 
-                showStatus('PDFを出力しました！ → ' + outputFileName, 'success');
+                showStatus('PDFを出力しました！（' + currentPage + 'ページ目に配置） → ' + outputFileName, 'success');
             } catch (error) {
                 console.error(error);
                 showStatus('エラーが発生しました: ' + error.message, 'warning');
